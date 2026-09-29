@@ -18,6 +18,7 @@ describe('App', () => {
   let httpTesting: HttpTestingController;
 
   beforeEach(async () => {
+    localStorage.removeItem('finance-dashboard-theme');
     await TestBed.configureTestingModule({
       imports: [App],
       providers: [provideHttpClient(), provideHttpClientTesting()],
@@ -26,6 +27,28 @@ describe('App', () => {
   });
 
   afterEach(() => httpTesting.verify());
+
+  it('toggles between light and dark themes and remembers the selection', async () => {
+    const fixture = TestBed.createComponent(App);
+    fixture.detectChanges();
+    httpTesting.expectOne('/api/v1/transactions').flush([]);
+    await fixture.whenStable();
+    fixture.detectChanges();
+
+    const root = fixture.nativeElement as HTMLElement;
+    const themeButton = root.querySelector<HTMLButtonElement>('.theme-toggle');
+    expect(root.querySelector('.app-shell')?.getAttribute('data-theme')).toBe('light');
+    expect(themeButton?.getAttribute('aria-pressed')).toBe('false');
+
+    themeButton?.click();
+    fixture.detectChanges();
+
+    expect(root.querySelector('.app-shell')?.getAttribute('data-theme')).toBe('dark');
+    expect(themeButton?.getAttribute('aria-pressed')).toBe('true');
+    expect(themeButton?.getAttribute('aria-label')).toBe('Switch to light mode');
+    expect(localStorage.getItem('finance-dashboard-theme')).toBe('dark');
+    expect(document.documentElement.dataset['theme']).toBe('dark');
+  });
 
   it('loads saved transactions and shows live empty-state totals when there are no records', async () => {
     const fixture = TestBed.createComponent(App);

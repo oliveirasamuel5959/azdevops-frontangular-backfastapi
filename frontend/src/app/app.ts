@@ -28,6 +28,8 @@ interface Feedback {
   message: string;
 }
 
+type Theme = 'light' | 'dark';
+
 @Component({
   selector: 'app-root',
   imports: [CurrencyPipe, DatePipe, ReactiveFormsModule],
@@ -48,6 +50,7 @@ export class App implements OnInit {
   protected readonly editingTransactionId = signal<string | null>(null);
   protected readonly feedback = signal<Feedback | null>(null);
   protected readonly activityFeedback = signal<Feedback | null>(null);
+  protected readonly theme = signal<Theme>(this.getInitialTheme());
 
   protected readonly netRecordedUsd = computed(() => {
     const cents = this.transactions()
@@ -101,7 +104,14 @@ export class App implements OnInit {
   });
 
   ngOnInit(): void {
+    this.applyTheme(this.theme());
     void this.loadTransactions();
+  }
+
+  protected toggleTheme(): void {
+    const nextTheme = this.theme() === 'light' ? 'dark' : 'light';
+    this.theme.set(nextTheme);
+    this.applyTheme(nextTheme);
   }
 
   protected async loadTransactions(): Promise<void> {
@@ -258,5 +268,39 @@ export class App implements OnInit {
     const month = String(today.getMonth() + 1).padStart(2, '0');
     const day = String(today.getDate()).padStart(2, '0');
     return `${today.getFullYear()}-${month}-${day}`;
+  }
+
+  private getInitialTheme(): Theme {
+    try {
+      const storedTheme = localStorage.getItem('finance-dashboard-theme');
+      if (storedTheme === 'light' || storedTheme === 'dark') {
+        return storedTheme;
+      }
+    } catch {
+      // Use the system preference when browser storage is unavailable.
+    }
+
+    if (
+      typeof window !== 'undefined' &&
+      window.matchMedia?.('(prefers-color-scheme: dark)').matches
+    ) {
+      return 'dark';
+    }
+    return 'light';
+  }
+
+  private applyTheme(theme: Theme): void {
+    if (typeof document !== 'undefined') {
+      document.documentElement.dataset['theme'] = theme;
+      document
+        .querySelector<HTMLMetaElement>('meta[name="theme-color"]')
+        ?.setAttribute('content', theme === 'dark' ? '#141b18' : '#173f36');
+    }
+
+    try {
+      localStorage.setItem('finance-dashboard-theme', theme);
+    } catch {
+      // The selected theme still applies for this session if storage is unavailable.
+    }
   }
 }
