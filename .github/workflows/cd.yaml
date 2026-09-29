@@ -41,6 +41,20 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      - name: Configure Container App ACR pull credentials
+        env:
+          REGISTRY_USERNAME: ${{ secrets.AZURE_REGISTER_NAME }}
+          REGISTRY_PASSWORD: ${{ secrets.AZURE_REGISTER_PASSWORD }}
+        run: |
+          az extension add --name containerapp --upgrade --allow-preview true
+          az containerapp registry set \
+            --name "$CONTAINER_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --server "$AZURE_CONTAINER_REGISTRY.azurecr.io" \
+            --username "$REGISTRY_USERNAME" \
+            --password "$REGISTRY_PASSWORD" \
+            --output none
+
       - name: Deploy to Azure Container App
         uses: azure/container-apps-deploy-action@v1
         with:
