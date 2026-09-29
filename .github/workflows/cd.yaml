@@ -7,7 +7,9 @@ on:
 
 env:
   AZURE_CONTAINER_REGISTRY: acrfinancialapp
-  
+  CONTAINER_APP_NAME: acrfinancialapp
+  RESOURCE_GROUP: rg-financial-app
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -33,3 +35,20 @@ jobs:
           push: true
           tags: ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/frontend:${{ github.sha }}
           file: ./frontend/Dockerfile
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy frontend revision
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          imageToDeploy: ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/frontend:${{ github.sha }}
+          acrName: ${{ env.AZURE_CONTAINER_REGISTRY }}
+          acrUsername: ${{ secrets.AZURE_REGISTER_NAME }}
+          acrPassword: ${{ secrets.AZURE_REGISTER_PASSWORD }}
+          resourceGroup: ${{ env.RESOURCE_GROUP }}
+          containerAppName: ${{ env.CONTAINER_APP_NAME }}
+          ingress: external
+          targetPort: 80
