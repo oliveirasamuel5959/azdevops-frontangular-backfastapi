@@ -1,4 +1,4 @@
-<div class="app-shell">
+<div class="app-shell" [attr.data-theme]="theme()">
   <aside class="sidebar" aria-label="Main navigation">
     <a class="brand" href="#dashboard" aria-label="Pocket home">
       <span class="brand-mark" aria-hidden="true">p</span>
@@ -40,6 +40,16 @@
       <div class="breadcrumb"><span>Workspace</span><span class="breadcrumb-divider">/</span><strong>Overview</strong></div>
       <div class="topbar-actions">
         <span class="demo-badge"><span></span> Personal workspace</span>
+        <button
+          class="theme-toggle"
+          type="button"
+          (click)="toggleTheme()"
+          [attr.aria-pressed]="theme() === 'dark'"
+          [attr.aria-label]="theme() === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'"
+        >
+          <span aria-hidden="true">{{ theme() === 'dark' ? '☀' : '☾' }}</span>
+          <span class="theme-toggle-label">{{ theme() === 'dark' ? 'Light mode' : 'Dark mode' }}</span>
+        </button>
         <button class="icon-button" type="button" aria-label="Notifications">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" /></svg>
           <i></i>
