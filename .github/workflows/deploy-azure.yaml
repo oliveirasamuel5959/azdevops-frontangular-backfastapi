@@ -1,65 +1,56 @@
-name: Deploy to Azure
+name: Deploy to Azure Container Apps
 
 on:
   workflow_dispatch:
-    inputs:
-      environment:
-        description: GitHub deployment environment
-        required: true
-        type: choice
-        options:
-          - staging
-          - production
-        default: staging
 
 permissions:
   contents: read
   id-token: write
 
 concurrency:
-  group: deploy-${{ inputs.environment }}
+  group: deploy-financialapp-production
   cancel-in-progress: false
 
 jobs:
   deploy:
-    name: Deploy ${{ inputs.environment }}
+    name: Deploy production Container Apps
     if: github.ref == 'refs/heads/main'
-    runs-on: ${{ fromJSON(vars.DEPLOY_RUNNER || '["ubuntu-latest"]') }}
+    runs-on: ubuntu-latest
     environment:
-      name: ${{ inputs.environment }}
+      name: production
     timeout-minutes: 60
     env:
       AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
       AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-      ACR_NAME: ${{ vars.ACR_NAME }}
-      ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
-      RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
-      FRONTEND_APP_NAME: ${{ vars.FRONTEND_APP_NAME }}
-      BACKEND_APP_NAME: ${{ vars.BACKEND_APP_NAME }}
-      API_UPSTREAM: ${{ vars.API_UPSTREAM }}
-      NGINX_RESOLVER: ${{ vars.NGINX_RESOLVER || '168.63.129.16' }}
-      BACKEND_IMAGE: ${{ vars.ACR_LOGIN_SERVER }}/personal-finance-backend:${{ github.sha }}
-      FRONTEND_IMAGE: ${{ vars.ACR_LOGIN_SERVER }}/personal-finance-frontend:${{ github.sha }}
+      ACR_NAME: ${{ vars.ACR_NAME || 'acrfinancialapp' }}
+      ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER || 'acrfinancialapp.azurecr.io' }}
+      RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP || 'rg-financial-app' }}
+      ACA_ENVIRONMENT: ${{ vars.ACA_ENVIRONMENT || 'managedEnvironment-rgfinancialapp-9076' }}
+      BACKEND_APP_NAME: ${{ vars.BACKEND_APP_NAME || 'financialapp' }}
+      FRONTEND_APP_NAME: ${{ vars.FRONTEND_APP_NAME || 'frontendfinanceapp' }}
+      NGINX_RESOLVER: ${{ vars.NGINX_RESOLVER || '127.0.0.11' }}
+      MIGRATION_JOB_NAME: financialapp-migrate
+      BACKEND_IMAGE: ${{ format('{0}/backend:{1}', vars.ACR_LOGIN_SERVER || 'acrfinancialapp.azurecr.io', github.sha) }}
+      FRONTEND_IMAGE: ${{ format('{0}/frontend:{1}', vars.ACR_LOGIN_SERVER || 'acrfinancialapp.azurecr.io', github.sha) }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate environment configuration
+      - name: Validate production configuration
         shell: bash
         run: |
-          : "${AZURE_CLIENT_ID:?Set the environment variable AZURE_CLIENT_ID}"
-          : "${AZURE_TENANT_ID:?Set the environment variable AZURE_TENANT_ID}"
-          : "${AZURE_SUBSCRIPTION_ID:?Set the environment variable AZURE_SUBSCRIPTION_ID}"
-          : "${ACR_NAME:?Set the environment variable ACR_NAME}"
-          : "${ACR_LOGIN_SERVER:?Set the environment variable ACR_LOGIN_SERVER}"
-          : "${RESOURCE_GROUP:?Set the environment variable RESOURCE_GROUP}"
-          : "${FRONTEND_APP_NAME:?Set the environment variable FRONTEND_APP_NAME}"
-          : "${BACKEND_APP_NAME:?Set the environment variable BACKEND_APP_NAME}"
-          : "${API_UPSTREAM:?Set API_UPSTREAM to the HTTPS URL of the API App Service}"
-          case "$API_UPSTREAM" in
-            https://*) ;;
-            *) echo "API_UPSTREAM must use HTTPS" >&2; exit 1 ;;
-          esac
+          : "${AZURE_CLIENT_ID:?Set production variable AZURE_CLIENT_ID}"
+          : "${AZURE_TENANT_ID:?Set production variable AZURE_TENANT_ID}"
+          : "${AZURE_SUBSCRIPTION_ID:?Set production variable AZURE_SUBSCRIPTION_ID}"
+          : "${ACR_NAME:?Set production variable ACR_NAME}"
+          : "${ACR_LOGIN_SERVER:?Set production variable ACR_LOGIN_SERVER}"
+          : "${RESOURCE_GROUP:?Set production variable RESOURCE_GROUP}"
+          : "${ACA_ENVIRONMENT:?Set production variable ACA_ENVIRONMENT}"
+          : "${BACKEND_APP_NAME:?Set production variable BACKEND_APP_NAME}"
+          : "${FRONTEND_APP_NAME:?Set production variable FRONTEND_APP_NAME}"
+
+      - name: Install Azure Container Apps CLI extension
+        run: az extension add --name containerapp --upgrade --allow-preview true
 
       - name: Sign in to Azure with GitHub OIDC
         uses: azure/login@v2
@@ -68,7 +59,7 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Build and push commit-tagged images to ACR
+      - name: Build and push commit-tagged images
         run: |
           az acr login --name "$ACR_NAME" --output none
           docker build --pull --tag "$BACKEND_IMAGE" ./backend
@@ -78,138 +69,195 @@ jobs:
 
       - name: Disable app-startup migrations before the one-off migration
         run: |
-          az webapp config appsettings set \
+          database_secret_ref="$(az containerapp show \
             --name "$BACKEND_APP_NAME" \
             --resource-group "$RESOURCE_GROUP" \
-            --settings RUN_MIGRATIONS=false \
-            --output none
+            --query "properties.template.containers[0].env[?name=='DATABASE_URL'].secretRef | [0]" \
+            --output tsv)"
+          : "${database_secret_ref:?The backend Container App must reference its DATABASE_URL secret}"
+          migrations_setting="$(az containerapp show \
+            --name "$BACKEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query "properties.template.containers[0].env[?name=='RUN_MIGRATIONS'].value | [0]" \
+            --output tsv)"
+          if [ "$migrations_setting" != "false" ]; then
+            az containerapp update \
+              --name "$BACKEND_APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --set-env-vars RUN_MIGRATIONS=false \
+              --output none
+            for attempt in $(seq 1 60); do
+              latest_revision="$(az containerapp show \
+                --name "$BACKEND_APP_NAME" \
+                --resource-group "$RESOURCE_GROUP" \
+                --query properties.latestRevisionName \
+                --output tsv)"
+              ready_revision="$(az containerapp show \
+                --name "$BACKEND_APP_NAME" \
+                --resource-group "$RESOURCE_GROUP" \
+                --query properties.latestReadyRevisionName \
+                --output tsv)"
+              if [ -n "$latest_revision" ] && [ "$latest_revision" = "$ready_revision" ]; then
+                break
+              fi
+              if [ "$attempt" -eq 60 ]; then
+                echo "Backend did not become ready with RUN_MIGRATIONS=false" >&2
+                exit 1
+              fi
+              sleep 5
+            done
+          fi
 
-      - name: Apply database migrations once before API rollout
+      - name: Create or update the one-off migration job
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          : "${DATABASE_URL:?Set the environment secret DATABASE_URL}"
-          docker run --rm --env DATABASE_URL "$BACKEND_IMAGE" \
-            uv run --no-sync alembic upgrade head
-
-      - name: Configure and deploy API container
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: |
-          : "${DATABASE_URL:?Set the environment secret DATABASE_URL}"
-          az webapp config appsettings set \
-            --name "$BACKEND_APP_NAME" \
+          : "${DATABASE_URL:?Set the production environment secret DATABASE_URL}"
+          az containerapp job create \
+            --name "$MIGRATION_JOB_NAME" \
             --resource-group "$RESOURCE_GROUP" \
-            --settings \
-              WEBSITES_PORT=8000 \
-              RUN_MIGRATIONS=false \
-              "DATABASE_URL=$DATABASE_URL" \
-            --output none
-          az webapp config set \
-            --name "$BACKEND_APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --acr-use-identity true \
-            --output none
-          az webapp config container set \
-            --name "$BACKEND_APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --container-image-name "$BACKEND_IMAGE" \
-            --container-registry-url "https://$ACR_LOGIN_SERVER" \
+            --environment "$ACA_ENVIRONMENT" \
+            --trigger-type Manual \
+            --replica-timeout 900 \
+            --replica-retry-limit 0 \
+            --replica-completion-count 1 \
+            --parallelism 1 \
+            --image "$BACKEND_IMAGE" \
+            --container-name migrator \
+            --cpu 0.25 \
+            --memory 0.5Gi \
+            --registry-server "$ACR_LOGIN_SERVER" \
+            --registry-identity system-environment \
+            --command /opt/venv/bin/alembic \
+            --args upgrade head \
+            --secrets "database-url=$DATABASE_URL" \
+            --env-vars "DATABASE_URL=secretref:database-url" \
             --output none
 
-      - name: Wait for API readiness
+      - name: Run database migrations once
+        id: migration
         run: |
-          for attempt in $(seq 1 36); do
-            if curl --fail --silent --show-error "$API_UPSTREAM/health/ready"; then
+          execution="$(az containerapp job start \
+            --name "$MIGRATION_JOB_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --output json)"
+          execution_name="$(jq --exit-status --raw-output '.name' <<< "$execution")"
+          printf 'execution_name=%s\n' "$execution_name" >> "$GITHUB_OUTPUT"
+
+          for attempt in $(seq 1 120); do
+            status="$(az containerapp job execution show \
+              --name "$MIGRATION_JOB_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --job-execution-name "$execution_name" \
+              --query properties.status \
+              --output tsv 2>/dev/null || true)"
+            case "$status" in
+              Succeeded) exit 0 ;;
+              Failed|Degraded|Stopped)
+                echo "Database migration job ended with status: $status" >&2
+                exit 1
+                ;;
+            esac
+            sleep 5
+          done
+          echo "Database migration job did not finish within 10 minutes (last poll: $attempt)" >&2
+          exit 1
+
+      - name: Show migration logs on failure
+        if: failure() && steps.migration.outputs.execution_name != ''
+        run: |
+          az containerapp job logs show \
+            --name "$MIGRATION_JOB_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --execution "${{ steps.migration.outputs.execution_name }}" \
+            --container migrator \
+            --tail 100 \
+            --format text || true
+
+      - name: Deploy API Container App
+        run: |
+          az containerapp update \
+            --name "$BACKEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$BACKEND_IMAGE" \
+            --set-env-vars RUN_MIGRATIONS=false \
+            --output none
+          api_fqdn="$(az containerapp show \
+            --name "$BACKEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)"
+          : "${api_fqdn:?The backend Container App must have ingress enabled}"
+          printf 'API_FQDN=%s\n' "$api_fqdn" >> "$GITHUB_ENV"
+          printf 'API_UPSTREAM=https://%s\n' "$api_fqdn" >> "$GITHUB_ENV"
+
+      - name: Wait for API revision and database readiness
+        run: |
+          api_revision="$(az containerapp show \
+            --name "$BACKEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query properties.latestRevisionName \
+            --output tsv)"
+          for attempt in $(seq 1 60); do
+            ready_revision="$(az containerapp show \
+              --name "$BACKEND_APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --query properties.latestReadyRevisionName \
+              --output tsv)"
+            api_status="$(curl --silent --show-error --connect-timeout 5 --max-time 10 \
+              --output /dev/null --write-out '%{http_code}' \
+              "$API_UPSTREAM/health/ready" || true)"
+            if [ "$ready_revision" = "$api_revision" ] && [ "$api_status" = "200" ]; then
               exit 0
-            fi
-            if [ "$attempt" -eq 36 ]; then
-              echo "API did not become ready in time" >&2
-              exit 1
             fi
             sleep 5
           done
+          echo "The new API revision did not become ready with PostgreSQL (last poll: $attempt)" >&2
+          exit 1
 
-      - name: Configure and deploy frontend container
+      - name: Deploy frontend Container App
         run: |
-          az webapp config appsettings set \
+          az containerapp update \
             --name "$FRONTEND_APP_NAME" \
             --resource-group "$RESOURCE_GROUP" \
-            --settings \
-              WEBSITES_PORT=80 \
+            --image "$FRONTEND_IMAGE" \
+            --set-env-vars \
               "API_UPSTREAM=$API_UPSTREAM" \
+              "API_UPSTREAM_HOST=$API_FQDN" \
               "NGINX_RESOLVER=$NGINX_RESOLVER" \
             --output none
-          az webapp config set \
+          frontend_fqdn="$(az containerapp show \
             --name "$FRONTEND_APP_NAME" \
             --resource-group "$RESOURCE_GROUP" \
-            --acr-use-identity true \
-            --output none
-          az webapp config container set \
-            --name "$FRONTEND_APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --container-image-name "$FRONTEND_IMAGE" \
-            --container-registry-url "https://$ACR_LOGIN_SERVER" \
-            --output none
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)"
+          : "${frontend_fqdn:?The frontend Container App must have ingress enabled}"
+          printf 'FRONTEND_URL=https://%s\n' "$frontend_fqdn" >> "$GITHUB_ENV"
 
-      - name: Wait for frontend readiness
-        env:
-          FRONTEND_URL: https://${{ vars.FRONTEND_APP_NAME }}.azurewebsites.net
+      - name: Wait for frontend revision and verify API proxy
         run: |
-          for attempt in $(seq 1 36); do
-            if curl --fail --silent --show-error "$FRONTEND_URL/" --output /dev/null; then
+          frontend_revision="$(az containerapp show \
+            --name "$FRONTEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query properties.latestRevisionName \
+            --output tsv)"
+          for attempt in $(seq 1 60); do
+            ready_revision="$(az containerapp show \
+              --name "$FRONTEND_APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --query properties.latestReadyRevisionName \
+              --output tsv)"
+            frontend_status="$(curl --silent --show-error --connect-timeout 5 --max-time 10 \
+              --output /dev/null --write-out '%{http_code}' \
+              "$FRONTEND_URL/" || true)"
+            proxy_response="$(curl --silent --show-error --connect-timeout 5 --max-time 10 \
+              "$FRONTEND_URL/api/v1/transactions" || true)"
+            if [ "$ready_revision" = "$frontend_revision" ] \
+              && [ "$frontend_status" = "200" ] \
+              && jq --exit-status 'type == "array"' <<< "$proxy_response" >/dev/null; then
               exit 0
-            fi
-            if [ "$attempt" -eq 36 ]; then
-              echo "Frontend did not become ready in time" >&2
-              exit 1
             fi
             sleep 5
           done
-
-      - name: Smoke test staging API and PostgreSQL persistence
-        if: inputs.environment == 'staging'
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: |
-          : "${DATABASE_URL:?Set the environment secret DATABASE_URL}"
-          category="Deploy smoke ${GITHUB_SHA:0:12}"
-          payload="$(jq -n --arg category "$category" --arg date "$(date -u +%F)" \
-            '{type:"expense", amount:"0.01", category:$category, description:"Staging deployment smoke test", transaction_date:$date, currency:"USD"}')"
-          response="$(curl --fail --silent --show-error \
-            --header 'Content-Type: application/json' \
-            --data "$payload" \
-            "$API_UPSTREAM/api/v1/transactions")"
-          jq --exit-status --arg category "$category" \
-            '.category == $category and .amount == "0.01"' <<< "$response"
-          docker run --rm \
-            --env DATABASE_URL \
-            --env "SMOKE_CATEGORY=$category" \
-            "$BACKEND_IMAGE" \
-            uv run --no-sync python -c '
-          import asyncio
-          import os
-
-          from sqlalchemy import func, select
-          from sqlalchemy.ext.asyncio import create_async_engine
-
-          from personal_finance_api.models.transaction import Transaction
-
-          async def main():
-              engine = create_async_engine(os.environ["DATABASE_URL"])
-              async with engine.connect() as connection:
-                  count = await connection.scalar(
-                      select(func.count())
-                      .select_from(Transaction)
-                      .where(Transaction.category == os.environ["SMOKE_CATEGORY"])
-                  )
-              await engine.dispose()
-              if count != 1:
-                  raise SystemExit(f"Expected one persisted smoke transaction, found {count}")
-
-          asyncio.run(main())
-          '
-
-      - name: Sign out from Azure
-        if: always()
-        run: az logout
+          echo "The frontend revision or transaction API proxy did not become ready (last poll: $attempt)" >&2
+          exit 1

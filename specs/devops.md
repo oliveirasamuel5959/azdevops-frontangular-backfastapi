@@ -2,7 +2,7 @@
 
 ## Goal and scope
 
-Provide a local Docker Compose stack and GitHub Actions CI for the Angular/FastAPI/PostgreSQL monolith. Prepare an explicit, manually invoked deployment workflow for later Azure staging and production deployment. Azure infrastructure and active production rollout are future work, not prerequisites for local development.
+Provide a local Docker Compose stack and GitHub Actions CI for the Angular/FastAPI/PostgreSQL monolith. Deploy the current production frontend/API pair to Azure Container Apps through a manually invoked workflow. Staging remains future work until separate staging apps and a database are provisioned.
 
 ## Requirements
 
@@ -19,28 +19,29 @@ Provide a local Docker Compose stack and GitHub Actions CI for the Angular/FastA
 
 - Add GitHub Actions CI for pull requests and pushes to the primary branch. It should install locked backend/frontend dependencies, run backend lint and tests, run frontend checks/tests/build, and build both container images.
 - Add a Compose-backed integration validation that waits for healthy services, posts a transaction, and confirms the API and database path works.
-- Add a separate `workflow_dispatch` deployment workflow scaffold. It should select staging or production through protected GitHub Environments, build/tag/push frontend and backend images to Azure Container Registry (ACR), then deploy the corresponding images to Azure App Service.
+- Add a separate `workflow_dispatch` deployment workflow for the production Container Apps pair. It should build and tag frontend/backend images with the source commit, push both images to ACR, apply a one-off database migration job, and update the API and frontend Container Apps.
 - Gate production with a required GitHub Environment approval. Use OIDC/federated credentials where configured instead of long-lived Azure credentials.
-- Document required Azure resources and configuration before enabling deployment: ACR, separate frontend/API App Service apps for staging and production (or an explicitly chosen equivalent topology), Azure Database for PostgreSQL, secure networking, TLS, app settings, and GitHub environment secrets/variables.
-- Keep staging and production configuration/data separate. Do not use the local `.env` file as an Azure secret source.
-- Run schema migrations as a controlled deployment step before the new API version receives traffic; do not allow competing app replicas to apply migrations concurrently.
+- Document required Azure resources and configuration: ACR, the Container Apps environment and separate frontend/API Container Apps, Azure Database for PostgreSQL, networking, TLS, Container Apps secrets/variables, and GitHub Environment configuration.
+- Do not use the local `.env` file as an Azure secret source. Keep production configuration and data separate from any future staging environment.
+- Run schema migrations in a single-replica Container Apps Job before the new API image receives traffic. Keep `RUN_MIGRATIONS=false` on the long-running API Container App so scaling replicas cannot race migrations.
 
 ### Azure workflow configuration contract
 
-The manual workflow runs from `main` and targets the selected GitHub Environment (`staging` or `production`). Configure each GitHub Environment independently with these variables:
+The manual workflow runs from `main` and targets the protected GitHub Environment `production`. Configure this GitHub Environment with:
 
-- `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_SUBSCRIPTION_ID` for the Azure workload identity used by GitHub OIDC.
-- `ACR_NAME` and `ACR_LOGIN_SERVER` for the registry; `RESOURCE_GROUP` for the target apps.
-- `FRONTEND_APP_NAME` and `BACKEND_APP_NAME` for that environment's Linux App Service apps.
-- `API_UPSTREAM` as the HTTPS base URL (without a trailing slash) of the matching API app, and optionally `NGINX_RESOLVER` if the environment uses a custom DNS resolver. The workflow defaults this resolver to `168.63.129.16`.
+- Variables `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_SUBSCRIPTION_ID` for GitHub OIDC.
+- Variables `ACR_NAME=acrfinancialapp`, `ACR_LOGIN_SERVER=acrfinancialapp.azurecr.io`, `RESOURCE_GROUP=rg-financial-app`, and `ACA_ENVIRONMENT=managedEnvironment-rgfinancialapp-9076`.
+- Variables `BACKEND_APP_NAME=financialapp` and `FRONTEND_APP_NAME=frontendfinanceapp`.
+- Secret `DATABASE_URL`, matching the database URL already referenced by the backend Container App.
+- Optionally set `NGINX_RESOLVER`; the workflow defaults it to `127.0.0.11` for the Container Apps environment.
 
-Optionally set the repository-level variable `DEPLOY_RUNNER` to a JSON array of runner labels when the default `ubuntu-latest` runner cannot reach private Azure resources (for example, `["self-hosted", "linux", "x64", "azure-vnet"]`). The runner must have Docker, Azure CLI, `curl`, and `jq` available.
+Create a GitHub OIDC federated credential with subject `repo:<owner>/<repository>:environment:production`. Grant its identity `AcrPush` on ACR and permissions to update the Container Apps and create/start a Container Apps Job in `rg-financial-app`. The Container Apps environment's `system-environment` identity must retain `AcrPull` on ACR. The migration runs inside the Container Apps environment, so the GitHub runner doesn't need database network access.
 
-Configure the environment-specific `DATABASE_URL` as a GitHub Environment secret. It must use TLS and connect only to that environment's Azure Database for PostgreSQL instance. If the database or App Services are private, use a self-hosted deployment runner with network access to both. Never copy values from the local `.env` file into Azure.
+The `DATABASE_URL` GitHub Environment secret must use TLS and connect to the production Azure Database for PostgreSQL instance. The workflow stores it as a secret on its migration Job and does not print it. Never copy values from the local `.env` file into Azure.
 
-Create an OIDC federated credential for each GitHub Environment subject (`repo:<owner>/<repository>:environment:<environment>`). Grant that identity `AcrPush` on ACR and the minimum permissions needed to update the target App Services. Enable a system-assigned identity on each App Service and grant it `AcrPull` on the registry; the workflow configures App Service to use that identity for image pulls. Set the backend app's `RUN_MIGRATIONS=false`; the workflow runs the new backend image once as a migration command before updating the API app image. Database changes must remain compatible with the currently serving API during this migration step.
+The workflow runs the migration Job with one replica, waits for it to succeed, then deploys the API and frontend images tagged with the commit SHA. Database changes must remain compatible with the currently serving API during this migration step.
 
-Before enabling production deployment, configure the `production` GitHub Environment with required reviewers. Provision separate staging and production databases and app settings, private networking and TLS as required, and separate frontend/API App Service apps for each environment. Set the frontend app to port `80`, the API app to port `8000`, and the frontend's `API_UPSTREAM` to the same-environment API HTTPS URL. The workflow tags both images with the source commit SHA.
+Configure the `production` GitHub Environment with required reviewers. The backend Container App listens on port `8000`; the frontend listens on port `80` and receives `API_UPSTREAM`, `API_UPSTREAM_HOST`, and `NGINX_RESOLVER` from the workflow. The workflow derives the API HTTPS hostname from the backend Container App.
 
 ## Implementation plan
 
@@ -48,8 +49,8 @@ Before enabling production deployment, configure the `production` GitHub Environ
 2. Add Compose services, health checks, persistent storage, and local API proxy/network behavior.
 3. Add developer commands/run instructions to `README.md` and verify the full local stack.
 4. Add CI workflows for locked installs, backend/frontend checks, container builds, and an API/database integration smoke test.
-5. Add a manually triggered Azure deployment workflow with staging/production environment selection and production approval gate.
-6. When Azure infrastructure is provisioned, configure OIDC, registry/repository settings, App Service targets, managed PostgreSQL connectivity, and staging smoke tests before enabling production deployments.
+5. Replace the App Service deployment scaffold with a manually triggered, production-protected Container Apps deployment workflow.
+6. Configure the production GitHub Environment, OIDC permissions, Container Apps environment identity, and DATABASE_URL secret; provision a separate staging stack before adding staging deployments.
 
 ## Validation and acceptance criteria
 
@@ -58,6 +59,7 @@ Before enabling production deployment, configure the `production` GitHub Environ
 - Frontend access works at the documented local URL, and a transaction submitted through the frontend reaches the API and is persisted in PostgreSQL.
 - CI runs on pull requests and relevant branch pushes, fails on backend/frontend check failures, and builds both Docker images.
 - The integration job validates transaction persistence against the Compose PostgreSQL service.
-- Deployment is manual until Azure resources and GitHub environment configuration exist; production requires an approval gate and uses production-specific settings.
-- Staging and production images are traceable to the source commit and are pushed to ACR before App Service rollout.
+- Deployment is manual to the production Container Apps pair; production requires a GitHub Environment approval gate.
+- Migrations complete once in a Container Apps Job before the new API revision receives traffic; the serving API has `RUN_MIGRATIONS=false`.
+- Production frontend and backend images are traceable to the source commit and are pushed to ACR before Container Apps rollout.
 - Secrets are not printed in logs, committed to the repository, or embedded in container image layers.
