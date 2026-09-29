@@ -2,7 +2,7 @@
 
 ## Goal and scope
 
-Build an asynchronous FastAPI service for the personal-finance dashboard. The initial release is a single-user demo with no authentication. The dashboard's financial summary can use frontend mock data; the backend's initial persistence feature is creating financial transactions in PostgreSQL.
+Build an asynchronous FastAPI service for the personal-finance dashboard. The initial release is a single-user demo with no authentication. The dashboard reads and writes financial transactions in PostgreSQL and derives its transaction summaries from those records.
 
 ## Requirements
 
@@ -49,6 +49,9 @@ Controllers must delegate business logic to services. Services use repositories 
 - Persist monetary values using a fixed-precision decimal database type; do not use binary floating-point values for money.
 - Define separate Pydantic schemas for transaction creation and transaction responses. Validate the transaction type, positive amount, date, and currency format at the request boundary.
 - Provide `POST /api/v1/transactions`, returning HTTP `201` and the persisted transaction representation on success.
+- Provide `GET /api/v1/transactions`, returning persisted transactions ordered by transaction date and creation time, newest first; provide `GET /api/v1/transactions/{id}` for a single record.
+- Provide `PUT /api/v1/transactions/{id}` for a validated full replacement and `DELETE /api/v1/transactions/{id}` returning HTTP `204` after deletion.
+- Return HTTP `404` for item GET, PUT, or DELETE requests when the transaction does not exist.
 - Expose liveness and readiness health endpoints. Readiness should verify that the service can connect to PostgreSQL.
 - Publish the OpenAPI schema and interactive docs in local development.
 - Return consistent validation and server error responses without leaking credentials or database internals.
@@ -65,7 +68,7 @@ Controllers must delegate business logic to services. Services use repositories 
 
 1. Initialize `backend/pyproject.toml` with `uv`, establish the `src/personal_finance_api/` package layout and import convention, and add configuration, logging, and async SQLAlchemy session management.
 2. Add the transaction model, initial Alembic migration, and create/response schemas.
-3. Implement repository, service, controller, and health endpoints using async functions end to end.
+3. Implement create, list, get, update, delete, and health operations through the repository, service, and controller layers using async functions end to end.
 4. Add tests using isolated database state, including request validation, successful persistence, and error cases.
 5. Add the backend Dockerfile and wire health checks, environment, and migrations into the local Compose workflow.
 6. Run formatting/lint, unit and API tests, migration checks, and image build in CI.
@@ -75,6 +78,8 @@ Controllers must delegate business logic to services. Services use repositories 
 - From `backend/`, `uv sync --locked` installs the dependencies declared in `pyproject.toml` reproducibly, and the package imports work from an installed environment rather than depending on the repository root being on `PYTHONPATH`.
 - Static checks pass and test coverage exercises transaction validation and the create use case.
 - An API integration test posts a valid transaction and confirms the returned record was committed and can be read back from PostgreSQL.
+- List and item GET routes return persisted records; PUT changes are persisted, invalid replacements leave the row unchanged, and DELETE removes the row.
+- Item GET, PUT, and DELETE return `404` for unknown transaction identifiers.
 - Invalid transaction types, non-positive amounts, and malformed input are rejected with appropriate client errors and create no database row.
 - Alembic can create a fresh schema and upgrade an existing test database to the latest revision.
 - Liveness succeeds without requiring database availability; readiness reports failure when PostgreSQL is unavailable and success when it is reachable.

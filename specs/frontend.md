@@ -2,7 +2,7 @@
 
 ## Goal and scope
 
-Build a single-page Angular personal-finance dashboard. The initial dashboard presents illustrative mock finance data and includes a small form to create a transaction through the FastAPI endpoint. It is a single-user demo and does not include login or registration.
+Build a single-page Angular personal-finance dashboard backed by saved transactions from the FastAPI API. It is a single-user demo and does not include login or registration.
 
 ## Requirements
 
@@ -15,19 +15,21 @@ Build a single-page Angular personal-finance dashboard. The initial dashboard pr
 
 ### Dashboard experience
 
-- Show mock summary data for a current balance, income, and expenses, plus a small recent-activity/transaction view.
-- Clearly treat this as demo data; do not imply that mock summary values are calculated from stored transactions.
+- Load the transaction list from `GET /api/v1/transactions` when the dashboard opens and show loading, empty, and retryable error states.
+- Show summary totals derived only from saved transactions. Keep currency totals separate; the initial summary cards can focus on USD transactions while the list displays each record's currency.
+- Show the user's saved transactions with category, description, transaction date, type, and amount.
 - Provide an entry form with transaction type, amount, category, optional description, date, and currency.
 - Validate required fields and positive monetary amounts before submitting. Keep amount handling decimal-safe in API payloads.
-- Submit the form to `POST /api/v1/transactions` using the `/api` proxy path. Show a clear pending state, success confirmation, and actionable validation/API error state.
+- Submit new records to `POST /api/v1/transactions` and edits to `PUT /api/v1/transactions/{id}` using the `/api` proxy path. Provide a delete action using `DELETE /api/v1/transactions/{id}`.
+- Reflect successful create, update, and delete operations in the list and derived summaries; show pending states and actionable validation/API errors.
 - Keep the dashboard usable at common desktop and mobile viewport sizes, and provide accessible labels and keyboard-operable controls.
 
 ## Implementation plan
 
 1. Generate the Angular application and establish its strict build, formatting, lint, and test commands.
-2. Implement the dashboard layout, mock summary widgets, and mock recent-activity data.
+2. Implement the dashboard layout and live summaries/list backed by the API.
 3. Add a typed transaction model and API service using Angular's HTTP client.
-4. Implement the transaction form, client-side validation, request state, and success/error feedback.
+4. Implement the transaction form, client-side validation, create/edit/delete actions, request state, and success/error feedback.
 5. Add production server configuration so `/api` is forwarded to the FastAPI container while the Angular app supports browser refresh/deep-link fallback.
 6. Add the multi-stage frontend Dockerfile and include frontend checks and image build in CI.
 
@@ -35,8 +37,8 @@ Build a single-page Angular personal-finance dashboard. The initial dashboard pr
 
 - Dependency installation is reproducible through the committed frontend lockfile.
 - Angular lint/static checks, unit tests, and production build pass in CI.
-- Component/form tests cover required fields, invalid amounts, submitting state, API success, and API error behavior.
-- The dashboard renders all mock summary values and recent-activity entries without requiring an API read endpoint.
-- A successful API response gives visible feedback; the UI does not present a failed write as saved.
-- The production container serves the dashboard and correctly proxies `/api/v1/transactions` to the backend.
+- Component/form tests cover initial GET loading, empty and error states, required fields, invalid amounts, create/update/delete success, and API errors.
+- The dashboard displays transactions and derived summary values from the API; it has no hard-coded transaction or finance-summary data.
+- Successful API responses update the UI; failed writes are not presented as saved.
+- The production container serves the dashboard and correctly proxies `/api/v1/transactions` CRUD requests to the backend.
 - Manual responsive/accessibility review confirms readable layout, labeled inputs, keyboard access, and visible form errors.

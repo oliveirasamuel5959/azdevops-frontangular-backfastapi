@@ -1,6 +1,6 @@
 # Personal Finance Dashboard
 
-A monolithic personal-finance web application with an Angular frontend, an asynchronous FastAPI backend, and PostgreSQL. The first release is a single-user demo: the dashboard uses mock data and a form writes a financial transaction to the database.
+A monolithic personal-finance web application with an Angular frontend, an asynchronous FastAPI backend, and PostgreSQL. The first release is a single-user demo: its dashboard summarizes stored transactions and lets the user create, update, and delete financial records.
 
 ## Project documentation
 

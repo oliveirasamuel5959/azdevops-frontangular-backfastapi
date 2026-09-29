@@ -32,6 +32,10 @@ class TransactionCreate(BaseModel):
         return value.strip() if value is not None else None
 
 
+class TransactionUpdate(TransactionCreate):
+    """Complete replacement data for an existing transaction."""
+
+
 class TransactionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
