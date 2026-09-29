@@ -1,10 +1,11 @@
 services:
   postgres:
     image: postgres:17-alpine
+    container_name: postgres
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-personal_finance}
       POSTGRES_USER: ${POSTGRES_USER:-finance_app}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_dev_change_me}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pass123}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
@@ -19,6 +20,7 @@ services:
   backend:
     build:
       context: ./backend
+    container_name: backend
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://finance_app:local_dev_change_me@postgres:5432/personal_finance}
       RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
@@ -43,8 +45,10 @@ services:
   frontend:
     build:
       context: ./frontend
+    container_name: frontend
     environment:
       API_UPSTREAM: ${API_UPSTREAM:-http://backend:8000}
+      API_UPSTREAM_HOST: ${API_UPSTREAM_HOST:-backend}
       NGINX_RESOLVER: ${NGINX_RESOLVER:-127.0.0.11}
     ports:
       - "${FRONTEND_PORT:-8080}:80"
