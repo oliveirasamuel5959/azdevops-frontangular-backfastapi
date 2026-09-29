@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+      - run: uv sync --locked
+      - run: uv run --locked ruff check src tests
+      - run: uv run --locked pytest
+
+  frontend:
+    name: Frontend checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm test -- --watch=false
+
+  container-build:
+    name: Build container images
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend image
+        run: docker build --tag personal-finance-backend:ci ./backend
+      - name: Build frontend image
+        run: docker build --tag personal-finance-frontend:ci ./frontend
+
+  compose-integration:
+    name: Compose API and database integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start healthy Compose stack
+        run: |
+          cp .env.example .env
+          docker compose up --build --detach --wait --wait-timeout 180
+      - name: Submit a transaction through the frontend proxy
+        run: |
+          payload="$(jq -n --arg date "$(date -u +%F)" '{type:"expense", amount:"10.25", category:"CI smoke test", description:"Compose integration check", transaction_date:$date, currency:"USD"}')"
+          response="$(curl --fail --silent --show-error \
+            --header 'Content-Type: application/json' \
+            --data "$payload" \
+            http://localhost:8080/api/v1/transactions)"
+          jq --exit-status '.category == "CI smoke test" and .amount == "10.25"' <<< "$response"
+      - name: Confirm transaction persistence in PostgreSQL
+        run: |
+          count="$(docker compose exec --no-TTY postgres \
+            psql -U finance_app -d personal_finance -Atc \
+            "SELECT count(*) FROM transactions WHERE category = 'CI smoke test';")"
+          test "$count" = "1"
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose logs
+      - name: Stop stack and remove ephemeral database volume
+        if: always()
+        run: docker compose down --volumes

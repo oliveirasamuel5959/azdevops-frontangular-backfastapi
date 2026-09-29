@@ -60,4 +60,4 @@ The main end-to-end check is to start the Compose stack, open the dashboard, sub
 
 ## Delivery status
 
-The Angular dashboard, FastAPI transaction API, PostgreSQL migration, Dockerfiles, and local Compose stack are implemented. GitHub Actions CI and the Azure deployment workflow remain to be added according to the linked DevOps spec.
+The Angular dashboard, FastAPI transaction API, PostgreSQL migration, Dockerfiles, local Compose stack, GitHub Actions CI, and manually triggered Azure deployment workflow are implemented. Azure resources and environment-specific GitHub configuration must be provisioned before enabling deployments; see the [DevOps spec](specs/devops.md).

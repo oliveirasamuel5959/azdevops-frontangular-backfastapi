@@ -1,0 +1,215 @@
+name: Deploy to Azure
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub deployment environment
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+        default: staging
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.environment }}
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ fromJSON(vars.DEPLOY_RUNNER || '["ubuntu-latest"]') }}
+    environment:
+      name: ${{ inputs.environment }}
+    timeout-minutes: 60
+    env:
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ACR_NAME: ${{ vars.ACR_NAME }}
+      ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+      RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+      FRONTEND_APP_NAME: ${{ vars.FRONTEND_APP_NAME }}
+      BACKEND_APP_NAME: ${{ vars.BACKEND_APP_NAME }}
+      API_UPSTREAM: ${{ vars.API_UPSTREAM }}
+      NGINX_RESOLVER: ${{ vars.NGINX_RESOLVER || '168.63.129.16' }}
+      BACKEND_IMAGE: ${{ vars.ACR_LOGIN_SERVER }}/personal-finance-backend:${{ github.sha }}
+      FRONTEND_IMAGE: ${{ vars.ACR_LOGIN_SERVER }}/personal-finance-frontend:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate environment configuration
+        shell: bash
+        run: |
+          : "${AZURE_CLIENT_ID:?Set the environment variable AZURE_CLIENT_ID}"
+          : "${AZURE_TENANT_ID:?Set the environment variable AZURE_TENANT_ID}"
+          : "${AZURE_SUBSCRIPTION_ID:?Set the environment variable AZURE_SUBSCRIPTION_ID}"
+          : "${ACR_NAME:?Set the environment variable ACR_NAME}"
+          : "${ACR_LOGIN_SERVER:?Set the environment variable ACR_LOGIN_SERVER}"
+          : "${RESOURCE_GROUP:?Set the environment variable RESOURCE_GROUP}"
+          : "${FRONTEND_APP_NAME:?Set the environment variable FRONTEND_APP_NAME}"
+          : "${BACKEND_APP_NAME:?Set the environment variable BACKEND_APP_NAME}"
+          : "${API_UPSTREAM:?Set API_UPSTREAM to the HTTPS URL of the API App Service}"
+          case "$API_UPSTREAM" in
+            https://*) ;;
+            *) echo "API_UPSTREAM must use HTTPS" >&2; exit 1 ;;
+          esac
+
+      - name: Sign in to Azure with GitHub OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build and push commit-tagged images to ACR
+        run: |
+          az acr login --name "$ACR_NAME" --output none
+          docker build --pull --tag "$BACKEND_IMAGE" ./backend
+          docker build --pull --tag "$FRONTEND_IMAGE" ./frontend
+          docker push "$BACKEND_IMAGE"
+          docker push "$FRONTEND_IMAGE"
+
+      - name: Disable app-startup migrations before the one-off migration
+        run: |
+          az webapp config appsettings set \
+            --name "$BACKEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --settings RUN_MIGRATIONS=false \
+            --output none
+
+      - name: Apply database migrations once before API rollout
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          : "${DATABASE_URL:?Set the environment secret DATABASE_URL}"
+          docker run --rm --env DATABASE_URL "$BACKEND_IMAGE" \
+            uv run --no-sync alembic upgrade head
+
+      - name: Configure and deploy API container
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          : "${DATABASE_URL:?Set the environment secret DATABASE_URL}"
+          az webapp config appsettings set \
+            --name "$BACKEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --settings \
+              WEBSITES_PORT=8000 \
+              RUN_MIGRATIONS=false \
+              "DATABASE_URL=$DATABASE_URL" \
+            --output none
+          az webapp config set \
+            --name "$BACKEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --acr-use-identity true \
+            --output none
+          az webapp config container set \
+            --name "$BACKEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --container-image-name "$BACKEND_IMAGE" \
+            --container-registry-url "https://$ACR_LOGIN_SERVER" \
+            --output none
+
+      - name: Wait for API readiness
+        run: |
+          for attempt in $(seq 1 36); do
+            if curl --fail --silent --show-error "$API_UPSTREAM/health/ready"; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 36 ]; then
+              echo "API did not become ready in time" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Configure and deploy frontend container
+        run: |
+          az webapp config appsettings set \
+            --name "$FRONTEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --settings \
+              WEBSITES_PORT=80 \
+              "API_UPSTREAM=$API_UPSTREAM" \
+              "NGINX_RESOLVER=$NGINX_RESOLVER" \
+            --output none
+          az webapp config set \
+            --name "$FRONTEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --acr-use-identity true \
+            --output none
+          az webapp config container set \
+            --name "$FRONTEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --container-image-name "$FRONTEND_IMAGE" \
+            --container-registry-url "https://$ACR_LOGIN_SERVER" \
+            --output none
+
+      - name: Wait for frontend readiness
+        env:
+          FRONTEND_URL: https://${{ vars.FRONTEND_APP_NAME }}.azurewebsites.net
+        run: |
+          for attempt in $(seq 1 36); do
+            if curl --fail --silent --show-error "$FRONTEND_URL/" --output /dev/null; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 36 ]; then
+              echo "Frontend did not become ready in time" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Smoke test staging API and PostgreSQL persistence
+        if: inputs.environment == 'staging'
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          : "${DATABASE_URL:?Set the environment secret DATABASE_URL}"
+          category="Deploy smoke ${GITHUB_SHA:0:12}"
+          payload="$(jq -n --arg category "$category" --arg date "$(date -u +%F)" \
+            '{type:"expense", amount:"0.01", category:$category, description:"Staging deployment smoke test", transaction_date:$date, currency:"USD"}')"
+          response="$(curl --fail --silent --show-error \
+            --header 'Content-Type: application/json' \
+            --data "$payload" \
+            "$API_UPSTREAM/api/v1/transactions")"
+          jq --exit-status --arg category "$category" \
+            '.category == $category and .amount == "0.01"' <<< "$response"
+          docker run --rm \
+            --env DATABASE_URL \
+            --env "SMOKE_CATEGORY=$category" \
+            "$BACKEND_IMAGE" \
+            uv run --no-sync python -c '
+          import asyncio
+          import os
+
+          from sqlalchemy import func, select
+          from sqlalchemy.ext.asyncio import create_async_engine
+
+          from personal_finance_api.models.transaction import Transaction
+
+          async def main():
+              engine = create_async_engine(os.environ["DATABASE_URL"])
+              async with engine.connect() as connection:
+                  count = await connection.scalar(
+                      select(func.count())
+                      .select_from(Transaction)
+                      .where(Transaction.category == os.environ["SMOKE_CATEGORY"])
+                  )
+              await engine.dispose()
+              if count != 1:
+                  raise SystemExit(f"Expected one persisted smoke transaction, found {count}")
+
+          asyncio.run(main())
+          '
+
+      - name: Sign out from Azure
+        if: always()
+        run: az logout

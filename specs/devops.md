@@ -25,6 +25,23 @@ Provide a local Docker Compose stack and GitHub Actions CI for the Angular/FastA
 - Keep staging and production configuration/data separate. Do not use the local `.env` file as an Azure secret source.
 - Run schema migrations as a controlled deployment step before the new API version receives traffic; do not allow competing app replicas to apply migrations concurrently.
 
+### Azure workflow configuration contract
+
+The manual workflow runs from `main` and targets the selected GitHub Environment (`staging` or `production`). Configure each GitHub Environment independently with these variables:
+
+- `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_SUBSCRIPTION_ID` for the Azure workload identity used by GitHub OIDC.
+- `ACR_NAME` and `ACR_LOGIN_SERVER` for the registry; `RESOURCE_GROUP` for the target apps.
+- `FRONTEND_APP_NAME` and `BACKEND_APP_NAME` for that environment's Linux App Service apps.
+- `API_UPSTREAM` as the HTTPS base URL (without a trailing slash) of the matching API app, and optionally `NGINX_RESOLVER` if the environment uses a custom DNS resolver. The workflow defaults this resolver to `168.63.129.16`.
+
+Optionally set the repository-level variable `DEPLOY_RUNNER` to a JSON array of runner labels when the default `ubuntu-latest` runner cannot reach private Azure resources (for example, `["self-hosted", "linux", "x64", "azure-vnet"]`). The runner must have Docker, Azure CLI, `curl`, and `jq` available.
+
+Configure the environment-specific `DATABASE_URL` as a GitHub Environment secret. It must use TLS and connect only to that environment's Azure Database for PostgreSQL instance. If the database or App Services are private, use a self-hosted deployment runner with network access to both. Never copy values from the local `.env` file into Azure.
+
+Create an OIDC federated credential for each GitHub Environment subject (`repo:<owner>/<repository>:environment:<environment>`). Grant that identity `AcrPush` on ACR and the minimum permissions needed to update the target App Services. Enable a system-assigned identity on each App Service and grant it `AcrPull` on the registry; the workflow configures App Service to use that identity for image pulls. Set the backend app's `RUN_MIGRATIONS=false`; the workflow runs the new backend image once as a migration command before updating the API app image. Database changes must remain compatible with the currently serving API during this migration step.
+
+Before enabling production deployment, configure the `production` GitHub Environment with required reviewers. Provision separate staging and production databases and app settings, private networking and TLS as required, and separate frontend/API App Service apps for each environment. Set the frontend app to port `80`, the API app to port `8000`, and the frontend's `API_UPSTREAM` to the same-environment API HTTPS URL. The workflow tags both images with the source commit SHA.
+
 ## Implementation plan
 
 1. Add `.gitignore` protection and `.env.example`; document the configuration contract.
