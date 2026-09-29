@@ -1,54 +1,300 @@
-name: Build and push frontend image to Azure Container Registry
+name: Deploy to Azure Container Apps
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
-env:
-  AZURE_CONTAINER_REGISTRY: acrfinancialapp
-  CONTAINER_APP_NAME: acrfinancialapp
-  RESOURCE_GROUP: rg-financial-app
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-financialapp-production
+  cancel-in-progress: false
 
 jobs:
-  build-and-push:
+  deploy:
+    name: Deploy production Container Apps
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-
+    timeout-minutes: 60
+    env:
+      ACR_NAME: acrfinancialapp
+      ACR_LOGIN_SERVER: acrfinancialapp.azurecr.io
+      RESOURCE_GROUP: rg-financial-app
+      ACA_ENVIRONMENT: managedEnvironment-rgfinancialapp-9076
+      BACKEND_APP_NAME: financialapp
+      FRONTEND_APP_NAME: frontendfinanceapp
+      NGINX_RESOLVER: 127.0.0.11
+      MIGRATION_JOB_NAME: financialapp-migrate
+      BACKEND_IMAGE: acrfinancialapp.azurecr.io/backend:${{ github.sha }}
+      FRONTEND_IMAGE: acrfinancialapp.azurecr.io/frontend:${{ github.sha }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+      - name: Validate repository secrets
+        env:
+          AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+          ACR_USERNAME: ${{ secrets.AZURE_REGISTER_NAME }}
+          ACR_PASSWORD: ${{ secrets.AZURE_REGISTER_PASSWORD }}
+        run: |
+          : "${AZURE_CREDENTIALS:?Set repository secret AZURE_CREDENTIALS}"
+          : "${ACR_USERNAME:?Set repository secret AZURE_REGISTER_NAME}"
+          : "${ACR_PASSWORD:?Set repository secret AZURE_REGISTER_PASSWORD}"
 
-      - name: Log in to Azure Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io
-          username: ${{ secrets.AZURE_REGISTER_NAME }}
-          password: ${{ secrets.AZURE_REGISTER_PASSWORD }}
+      - name: Install Azure Container Apps CLI extension
+        run: az extension add --name containerapp --upgrade --allow-preview true
 
-      - name: Build and push frontend image
-        uses: docker/build-push-action@v4
-        with:
-          context: ./frontend
-          push: true
-          tags: ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/frontend:${{ github.sha }}
-          file: ./frontend/Dockerfile
-
-      - name: Azure Login
+      - name: Sign in to Azure
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Deploy frontend revision
-        uses: azure/container-apps-deploy-action@v1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
         with:
-          imageToDeploy: ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/frontend:${{ github.sha }}
-          acrName: ${{ env.AZURE_CONTAINER_REGISTRY }}
-          acrUsername: ${{ secrets.AZURE_REGISTER_NAME }}
-          acrPassword: ${{ secrets.AZURE_REGISTER_PASSWORD }}
-          resourceGroup: ${{ env.RESOURCE_GROUP }}
-          containerAppName: ${{ env.CONTAINER_APP_NAME }}
-          ingress: external
-          targetPort: 80
+          registry: ${{ env.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.AZURE_REGISTER_NAME }}
+          password: ${{ secrets.AZURE_REGISTER_PASSWORD }}
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ env.BACKEND_IMAGE }}
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          tags: ${{ env.FRONTEND_IMAGE }}
+
+      - name: Configure Container Apps to pull from ACR
+        run: |
+          az containerapp registry set \
+            --name "$BACKEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --server "$ACR_LOGIN_SERVER" \
+            --identity system-environment \
+            --output none
+          az containerapp registry set \
+            --name "$FRONTEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --server "$ACR_LOGIN_SERVER" \
+            --identity system-environment \
+            --output none
+
+      - name: Disable app-startup migrations before the one-off migration
+        run: |
+          database_secret_ref="$(az containerapp show \
+            --name "$BACKEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query "properties.template.containers[0].env[?name=='DATABASE_URL'].secretRef | [0]" \
+            --output tsv)"
+          : "${database_secret_ref:?The backend Container App must reference its DATABASE_URL secret}"
+          migrations_setting="$(az containerapp show \
+            --name "$BACKEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query "properties.template.containers[0].env[?name=='RUN_MIGRATIONS'].value | [0]" \
+            --output tsv)"
+          if [ "$migrations_setting" != "false" ]; then
+            az containerapp update \
+              --name "$BACKEND_APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --set-env-vars RUN_MIGRATIONS=false \
+              --output none
+            for attempt in $(seq 1 60); do
+              latest_revision="$(az containerapp show \
+                --name "$BACKEND_APP_NAME" \
+                --resource-group "$RESOURCE_GROUP" \
+                --query properties.latestRevisionName \
+                --output tsv)"
+              ready_revision="$(az containerapp show \
+                --name "$BACKEND_APP_NAME" \
+                --resource-group "$RESOURCE_GROUP" \
+                --query properties.latestReadyRevisionName \
+                --output tsv)"
+              if [ -n "$latest_revision" ] && [ "$latest_revision" = "$ready_revision" ]; then
+                break
+              fi
+              if [ "$attempt" -eq 60 ]; then
+                echo "Backend did not become ready with RUN_MIGRATIONS=false" >&2
+                exit 1
+              fi
+              sleep 5
+            done
+          fi
+
+      - name: Create or update the one-off migration job
+        run: |
+          set -euo pipefail
+          database_secret_ref="$(az containerapp show \
+            --name "$BACKEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query "properties.template.containers[0].env[?name=='DATABASE_URL'].secretRef | [0]" \
+            --output tsv)"
+          : "${database_secret_ref:?The backend Container App must reference its DATABASE_URL secret}"
+          backend_secrets="$(az containerapp secret list \
+            --name "$BACKEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --show-values \
+            --output json)"
+          database_url="$(jq --raw-output --arg name "$database_secret_ref" \
+            '.[] | select(.name == $name) | .value // empty' <<< "$backend_secrets")"
+          unset backend_secrets
+          : "${database_url:?The referenced DATABASE_URL secret must have a readable value in the backend Container App}"
+          echo "::add-mask::$database_url"
+
+          az containerapp job create \
+            --name "$MIGRATION_JOB_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --environment "$ACA_ENVIRONMENT" \
+            --trigger-type Manual \
+            --replica-timeout 900 \
+            --replica-retry-limit 0 \
+            --replica-completion-count 1 \
+            --parallelism 1 \
+            --image "$BACKEND_IMAGE" \
+            --container-name migrator \
+            --cpu 0.25 \
+            --memory 0.5Gi \
+            --registry-server "$ACR_LOGIN_SERVER" \
+            --registry-identity system-environment \
+            --command /opt/venv/bin/alembic \
+            --args upgrade head \
+            --secrets "database-url=$database_url" \
+            --env-vars "DATABASE_URL=secretref:database-url" \
+            --output none
+
+      - name: Run database migrations once
+        id: migration
+        run: |
+          execution="$(az containerapp job start \
+            --name "$MIGRATION_JOB_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --output json)"
+          execution_name="$(jq --exit-status --raw-output '.name' <<< "$execution")"
+          printf 'execution_name=%s\n' "$execution_name" >> "$GITHUB_OUTPUT"
+
+          for attempt in $(seq 1 120); do
+            status="$(az containerapp job execution show \
+              --name "$MIGRATION_JOB_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --job-execution-name "$execution_name" \
+              --query properties.status \
+              --output tsv 2>/dev/null || true)"
+            case "$status" in
+              Succeeded) exit 0 ;;
+              Failed|Degraded|Stopped)
+                echo "Database migration job ended with status: $status" >&2
+                exit 1
+                ;;
+            esac
+            sleep 5
+          done
+          echo "Database migration job did not finish within 10 minutes (last poll: $attempt)" >&2
+          exit 1
+
+      - name: Show migration logs on failure
+        if: failure() && steps.migration.outputs.execution_name != ''
+        run: |
+          az containerapp job logs show \
+            --name "$MIGRATION_JOB_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --execution "${{ steps.migration.outputs.execution_name }}" \
+            --container migrator \
+            --tail 100 \
+            --format text || true
+
+      - name: Deploy API Container App
+        run: |
+          az containerapp update \
+            --name "$BACKEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$BACKEND_IMAGE" \
+            --set-env-vars RUN_MIGRATIONS=false \
+            --output none
+          api_fqdn="$(az containerapp show \
+            --name "$BACKEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)"
+          : "${api_fqdn:?The backend Container App must have ingress enabled}"
+          printf 'API_FQDN=%s\n' "$api_fqdn" >> "$GITHUB_ENV"
+          printf 'API_UPSTREAM=https://%s\n' "$api_fqdn" >> "$GITHUB_ENV"
+
+      - name: Wait for API revision and database readiness
+        run: |
+          api_revision="$(az containerapp show \
+            --name "$BACKEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query properties.latestRevisionName \
+            --output tsv)"
+          for attempt in $(seq 1 60); do
+            ready_revision="$(az containerapp show \
+              --name "$BACKEND_APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --query properties.latestReadyRevisionName \
+              --output tsv)"
+            api_status="$(curl --silent --show-error --connect-timeout 5 --max-time 10 \
+              --output /dev/null --write-out '%{http_code}' \
+              "$API_UPSTREAM/health/ready" || true)"
+            if [ "$ready_revision" = "$api_revision" ] && [ "$api_status" = "200" ]; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "The new API revision did not become ready with PostgreSQL (last poll: $attempt)" >&2
+          exit 1
+
+      - name: Deploy frontend Container App
+        run: |
+          az containerapp update \
+            --name "$FRONTEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$FRONTEND_IMAGE" \
+            --set-env-vars \
+              "API_UPSTREAM=$API_UPSTREAM" \
+              "API_UPSTREAM_HOST=$API_FQDN" \
+              "NGINX_RESOLVER=$NGINX_RESOLVER" \
+            --output none
+          frontend_fqdn="$(az containerapp show \
+            --name "$FRONTEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)"
+          : "${frontend_fqdn:?The frontend Container App must have ingress enabled}"
+          printf 'FRONTEND_URL=https://%s\n' "$frontend_fqdn" >> "$GITHUB_ENV"
+
+      - name: Wait for frontend revision and verify API proxy
+        run: |
+          frontend_revision="$(az containerapp show \
+            --name "$FRONTEND_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query properties.latestRevisionName \
+            --output tsv)"
+          for attempt in $(seq 1 60); do
+            ready_revision="$(az containerapp show \
+              --name "$FRONTEND_APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --query properties.latestReadyRevisionName \
+              --output tsv)"
+            frontend_status="$(curl --silent --show-error --connect-timeout 5 --max-time 10 \
+              --output /dev/null --write-out '%{http_code}' \
+              "$FRONTEND_URL/" || true)"
+            proxy_response="$(curl --silent --show-error --connect-timeout 5 --max-time 10 \
+              "$FRONTEND_URL/api/v1/transactions" || true)"
+            if [ "$ready_revision" = "$frontend_revision" ] \
+              && [ "$frontend_status" = "200" ] \
+              && jq --exit-status 'type == "array"' <<< "$proxy_response" >/dev/null; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "The frontend revision or transaction API proxy did not become ready (last poll: $attempt)" >&2
+          exit 1

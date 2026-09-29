@@ -60,4 +60,4 @@ The main end-to-end check is to start the Compose stack, open the dashboard, sub
 
 ## Delivery status
 
-The Angular dashboard, FastAPI transaction API, PostgreSQL migration, Dockerfiles, local Compose stack, GitHub Actions CI, and manually triggered production Azure Container Apps deployment workflow are implemented. Configure the production GitHub Environment's OIDC variables, database secret, and required reviewers before dispatching deployments; see the [DevOps spec](specs/devops.md).
+The Angular dashboard, FastAPI transaction API, PostgreSQL migration, Dockerfiles, local Compose stack, GitHub Actions CI, and production Azure Container Apps deployment workflow are implemented. Configure the repository secrets `AZURE_CREDENTIALS`, `AZURE_REGISTER_NAME`, and `AZURE_REGISTER_PASSWORD` for deployment; see the [DevOps spec](specs/devops.md).
